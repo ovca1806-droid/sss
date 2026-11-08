@@ -4,7 +4,6 @@ import random
 import re
 import time
 import html
-from html.parser import HTMLParser
 import winsound
 
 import random
@@ -16,6 +15,7 @@ from urllib.parse import urlparse, parse_qs
 from uuid import uuid4
 from pathlib import Path
 
+from telegram_bot import TelegramBot
 
 # ============================================================
 # НАСТРОЙКИ
@@ -146,7 +146,13 @@ USER_COOKIE = ""
 COOKIE_FILE = Path(__file__).with_name("ozon_cookies.txt")
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
 
-BLOCKS_TO_LOAD = 4
+BLOCKS_TO_LOAD = 22
+
+PRICE_CAP = 6000
+
+# ============================================================
+# ИНИЦИАЛИЗАЦИЯ
+# ============================================================
 
 seen_products = set()
 
@@ -278,7 +284,7 @@ def load_next_page(session, next_page, category_url, page_view_id):
 
         if response.status_code == 403:
             print("[-] API вернул 403. Пауза 10 минут.")
-            time.sleep(600)
+            time.sleep(30)
             return None
 
         if response.status_code != 200:
@@ -323,7 +329,7 @@ def find_review_badge(item):
 # ПАРСИНГ ТОВАРОВ
 # ============================================================
 
-def parse_ozon_products(json_data):
+def parse_ozon_products(json_data, telegram_bot=None, session=None):
 
     widget_states = json_data.get("widgetStates", {})
 
@@ -344,10 +350,10 @@ def parse_ozon_products(json_data):
 
             product_id = str(item.get("id") or item.get("sku") or "")
 
-            if not product_id or product_id in seen_products:
+            if not product_id: # or product_id in seen_products:
                 continue
 
-            seen_products.add(product_id)
+            #seen_products.add(product_id)
 
             badge = find_review_badge(item)
 
@@ -359,6 +365,8 @@ def parse_ozon_products(json_data):
             old_price = ""
             rating = ""
             reviews = ""
+
+            should_skip = False
 
             for block in item.get("mainState", []):
 
@@ -379,9 +387,15 @@ def parse_ozon_products(json_data):
 
                         if style == "PRICE":
                             price = text
+                            if price > PRICE_CAP:
+                                should_skip = True
+                                break
 
                         elif style == "ORIGINAL_PRICE":
                             old_price = text
+
+                elif should_skip:
+                    break
 
                 elif block_type == "labelListV2":
 
@@ -397,6 +411,9 @@ def parse_ozon_products(json_data):
 
                         elif re.search(r"отзыв", text, re.IGNORECASE):
                             reviews = text
+
+            if should_skip:
+                continue
 
             product_url = item.get("action", {}).get("link", "")
 
@@ -419,17 +436,34 @@ def parse_ozon_products(json_data):
             print("Рейтинг:", rating)
             print("Отзывы:", reviews)
             print("Ссылка:", product_url)
-            print("Изображение:", image_url)
             print("=" * 45)
 
             winsound.Beep(1300, 100)
+
+            if telegram_bot:
+                telegram_bot.send_product(
+                    product_id=product_id,
+                    name=name,
+                    price=price,
+                    badge=badge,
+                    product_url=product_url,
+                    image_url=image_url,
+                    ozon_session=session
+                )
+
+            #time.sleep(100)
 
 
 # ============================================================
 # ЗАГРУЗКА ЧЕТЫРЁХ ДОПОЛНИТЕЛЬНЫХ БЛОКОВ
 # ============================================================
 
-def load_additional_blocks(session, next_page, category_url):
+def load_additional_blocks(
+    session,
+    next_page,
+    category_url,
+    telegram_bot=None
+):
 
     page_view_id = str(uuid4())
 
@@ -452,7 +486,7 @@ def load_additional_blocks(session, next_page, category_url):
             print("[-] Загрузка блока прервана")
             break
 
-        parse_ozon_products(data)
+        parse_ozon_products(data, telegram_bot, session)
 
         next_page = data.get("nextPage")
 
@@ -461,7 +495,7 @@ def load_additional_blocks(session, next_page, category_url):
             break
 
         if block_num < BLOCKS_TO_LOAD:
-            time.sleep(random.uniform(1, 2))
+            time.sleep(random.uniform(1, 1.5))
 
 
 # ============================================================
@@ -471,6 +505,12 @@ def load_additional_blocks(session, next_page, category_url):
 def main():
 
     print("[*] Мониторинг Ozon запущен")
+
+    telegram_bot = TelegramBot()
+
+    print("[Telegram] Бот подключён")
+
+    telegram_bot.check_updates()
 
     with curl_cffi.requests.Session() as session:
 
@@ -498,26 +538,29 @@ def main():
             for index, category_url in enumerate(category_urls):
                 print(f"\nПроверяем категорию: {category_url}")
 
+                telegram_bot.check_updates()
+
                 try:
                     response = session.get(
-                        CATEGORY_URL,
+                        category_url,
                         timeout=20
                     )
 
                     if response.status_code == 403:
-                        print("[-] Ozon вернул 403. Пауза 10 минут.")
-                        time.sleep(600)
+                        print("[-] Ozon вернул 403. Пауза 2 минут.")
+                        time.sleep(120)
                         continue
 
                     if response.status_code != 200:
-                        print(f"[-] Ошибка страницы: {response.status_code}")
+                        print(f"[-] Ошибка страницы: {response.status_code}. Пауза 0,5 минут.")
                         time.sleep(30)
                         continue
 
                     print("[+] HTML страницы получен")
 
-                    if not check_login_status(page_html):
+                    if not check_login_status(response.text):
                         print("⚠️ Вы не авторизованы в Ozon! Проверьте ozon_cookies.txt.")
+                        telegram_bot.send_login_required(category_url)
                         time.sleep(120)
                         return 0
 
@@ -525,13 +568,14 @@ def main():
                     initial_data = extract_initial_products(response.text)
 
                     if initial_data:
-                        parse_ozon_products(initial_data)
+                        parse_ozon_products(initial_data, telegram_bot, session)
+                        time.sleep(1)
 
                     next_page = extract_next_page(response.text)
 
                     if not next_page:
                         print("[-] Не удалось извлечь nextPage")
-                        time.sleep(60)
+                        time.sleep(20)
                         continue
 
                     print("[+] nextPage извлечён")
@@ -539,7 +583,8 @@ def main():
                     load_additional_blocks(
                         session,
                         next_page,
-                        CATEGORY_URL
+                        category_url,
+                        telegram_bot
                     )
 
                 except Exception as err:
@@ -552,9 +597,9 @@ def main():
                         print(f"Пауза перед следующей категорией: {delay:.1f} сек.")
                         time.sleep(delay)
 
-            round_delay = random.uniform(2, 5)
+            round_delay = random.uniform(1, 2)
 
-            print(f"\nВсе категории проверены. Следующий круг через {delay:.1f} сек.")
+            print(f"\nВсе категории проверены. Следующий круг через {round_delay:.1f} сек.")
 
             time.sleep(round_delay)
 
